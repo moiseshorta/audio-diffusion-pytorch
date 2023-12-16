@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import Tensor
 from tqdm import tqdm
+import random
 
 from .utils import default
 
@@ -64,11 +65,8 @@ class Diffusion(nn.Module):
 
     pass
 
-
 class VDiffusion(Diffusion):
-    def __init__(
-        self, net: nn.Module, sigma_distribution: Distribution = UniformDistribution(), loss_fn: Any = F.mse_loss
-    ):
+    def __init__(self, net: nn.Module, sigma_distribution: Distribution = UniformDistribution(), loss_fn: Any = F.mse_loss):
         super().__init__()
         self.net = net
         self.sigma_distribution = sigma_distribution
@@ -79,17 +77,74 @@ class VDiffusion(Diffusion):
         alpha, beta = torch.cos(angle), torch.sin(angle)
         return alpha, beta
 
+    def _generate_triangular_noise(self, input_tensor):
+        # Triangular noise generation
+        uniform_noise1 = torch.rand_like(input_tensor) - 0.5
+        uniform_noise2 = torch.rand_like(input_tensor) - 0.5
+        triangular_noise = uniform_noise1 + uniform_noise2
+        return triangular_noise
+
+    def _generate_fractal_noise(self, input_tensor, num_scales=10):
+        length = input_tensor.shape[-1]
+        fractal_noise = torch.zeros_like(input_tensor)
+
+        for i in range(num_scales):
+            scale_factor = 2 ** i
+            scaled_length = max(1, length // scale_factor)
+            scaled_noise = torch.randn(*input_tensor.shape[:-1], scaled_length, device=input_tensor.device)
+
+            # Upsample the noise to match the original length
+            upscaled_noise = torch.nn.functional.interpolate(scaled_noise, size=length, mode='linear')
+            fractal_noise += upscaled_noise / scale_factor
+
+        return fractal_noise / fractal_noise.std(dim=-1, keepdim=True)
+
+    def _generate_pyramid_noise(self, input_tensor, discount=0.555, num_scales=10):
+        length = input_tensor.shape[-1]  # Get the length of the sequence
+        noise = torch.randn_like(input_tensor)
+
+        for i in range(num_scales):
+            scale_factor = random.random() * 2 + 2
+            new_length = max(1, int(length / (scale_factor ** i)))
+            scaled_noise = torch.randn(*input_tensor.shape[:-1], new_length, device=input_tensor.device)
+
+            # Upsample the noise to match the original length
+            upscaled_noise = torch.nn.functional.interpolate(scaled_noise, size=length, mode='linear')
+            noise += upscaled_noise * (discount ** i)
+
+            if new_length == 1:
+                break
+
+        return noise / noise.std(dim=-1, keepdim=True)
+
+
+    def _generate_offset_noise(self, input_tensor, offset_scale=0.1):
+        shape = list(input_tensor.shape)
+        shape[-2:] = [1, 1]  # Set the last two dimensions to 1
+        offset_noise = offset_scale * torch.randn(*shape, device=input_tensor.device)
+        return offset_noise
+
     def forward(self, x: Tensor, **kwargs) -> Tensor:  # type: ignore
         batch_size, device = x.shape[0], x.device
         # Sample amount of noise to add for each batch element
         sigmas = self.sigma_distribution(num_samples=batch_size, device=device)
         sigmas_batch = extend_dim(sigmas, dim=x.ndim)
-        # Get noise
-        noise = torch.randn_like(x)
-        # Combine input and noise weighted by half-circle
+        # # Get noise
+        # noise = torch.randn_like(x)
+
+        # # Generate offset noise
+        # offset_noise =  noise + self._generate_offset_noise(x)
+
+        # # Generate pyramid noise
+        # pyramid_noise = self._generate_pyramid_noise(x)
+
+        noise = self._generate_pyramid_noise(x)
+
+        # Combine input and offset noise weighted by half-circle
         alphas, betas = self.get_alpha_beta(sigmas_batch)
         x_noisy = alphas * x + betas * noise
         v_target = alphas * noise - betas * x
+
         # Predict velocity and return loss
         v_pred = self.net(x_noisy, sigmas, **kwargs)
         return self.loss_fn(v_pred, v_target)
