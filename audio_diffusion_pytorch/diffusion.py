@@ -135,9 +135,6 @@ class VDiffusion(Diffusion):
         # # Generate offset noise
         # offset_noise =  noise + self._generate_offset_noise(x)
 
-        # # Generate pyramid noise
-        # pyramid_noise = self._generate_pyramid_noise(x)
-
         noise = self._generate_pyramid_noise(x)
 
         # Combine input and offset noise weighted by half-circle
